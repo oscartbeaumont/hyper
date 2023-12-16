@@ -9,6 +9,7 @@ use std::{
 use crate::rt::{Read, Write};
 use bytes::{Buf, Bytes};
 use http::Request;
+use pin_project_lite::pin_project;
 
 use super::{Http1Transaction, Wants};
 use crate::body::{Body, DecodedLength, Incoming as IncomingBody};
@@ -16,11 +17,21 @@ use crate::common::task;
 use crate::proto::{BodyLength, Conn, Dispatched, MessageHead, RequestHead};
 use crate::upgrade::OnUpgrade;
 
+pin_project! {
+    #[project = CursedBodyProj]
+    enum BodyImpl<Bs> {
+        Body {
+            #[pin]
+            body: Bs
+        },
+    }
+}
+
 pub(crate) struct Dispatcher<D, Bs: Body, I, T> {
     conn: Conn<I, Bs::Data, T>,
     dispatch: D,
     body_tx: Option<crate::body::Sender>,
-    body_rx: Pin<Box<Option<Bs>>>,
+    body_rx: Pin<Box<Option<BodyImpl<Bs>>>>,
     is_closing: bool,
 }
 
@@ -320,7 +331,7 @@ where
                             .exact()
                             .map(BodyLength::Known)
                             .or(Some(BodyLength::Unknown));
-                        self.body_rx.set(Some(body));
+                        self.body_rx.set(Some(BodyImpl::Body { body }));
                         btype
                     };
                     self.conn.write_head(head, body_type);
@@ -332,18 +343,22 @@ where
                 ready!(self.poll_flush(cx))?;
             } else {
                 // A new scope is needed :(
-                if let (Some(mut body), clear_body) =
-                    OptGuard::new(self.body_rx.as_mut()).guard_mut()
-                {
+                if let (Some(body), clear_body) = OptGuard::new(self.body_rx.as_mut()).guard_mut() {
                     debug_assert!(!*clear_body, "opt guard defaults to keeping body");
                     if !self.conn.can_write_body() {
                         trace!(
                             "no more write body allowed, user body is_end_stream = {}",
-                            body.is_end_stream(),
+                            match body.project() {
+                                CursedBodyProj::Body { body } => body.is_end_stream(),
+                            },
                         );
                         *clear_body = true;
                         continue;
                     }
+
+                    let mut body = match body.project() {
+                        CursedBodyProj::Body { body } => body,
+                    };
 
                     let item = ready!(body.as_mut().poll_frame(cx));
                     if let Some(item) = item {
